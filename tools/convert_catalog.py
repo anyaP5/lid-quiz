@@ -51,7 +51,7 @@ MANUAL_ANSWERS: dict[int, tuple[int, str]] = {
 STATE_ANSWERS: dict[int, int] = {}
 
 # Questions whose answer depends on current events: always listed for checking.
-TIME_SENSITIVE = re.compile(r"jetzig|heutig|zurzeit|aktuell|derzeit|momentan", re.IGNORECASE)
+TIME_SENSITIVE = re.compile(r"\bjetzig|\bheutiges\b|zurzeit|aktuell|derzeit|momentan", re.IGNORECASE)
 
 CHECKBOXES =("", "□")  # ☐ glyph (Wingdings2) in front of each option; a few pages use "□"
 MAX_IMAGE_WIDTH = 1000        # px, keeps photos small enough for the phone
@@ -322,7 +322,11 @@ def main(catalog_pdf: str, flashcards_pdf: str) -> None:
     for old in OUT_IMAGES.glob("*"):
         old.unlink()
 
-    output, problems, notes = [], [], []
+    output = []
+    problems = []          # technical: the PDF couldn't be read as expected
+    missing = []           # (entry, reason): no correct answer yet
+    from_claude = []       # (entry, reason): answer from MANUAL_ANSWERS
+    time_sensitive = []    # entries whose answer depends on current events
 
     for q in general + mine:
         qid = str(q["number"]) if q["state"] is None else f"{STATE_ID}-{q['number']}"
@@ -357,66 +361,89 @@ def main(catalog_pdf: str, flashcards_pdf: str) -> None:
             entry["state"] = STATE_ID
 
         # --- correct answer ---
-        correct = None
-        if q["state"] is None:
+        # Question and option TEXT always come from the BAMF catalog. The flashcards are
+        # only used to find out WHICH catalog option is correct.
+        correct, missing_reason = None, "no answer source"
+        if q["state"] is not None:
+            missing_reason = "state question — fill in STATE_ANSWERS"
+        elif len(q["options"]) != 4:
+            missing_reason = "could not read the options from the PDF"
+        else:
             card = cards.get(q["number"])
             letter = answers.get(q["number"])
-            if len(q["options"]) != 4:
-                pass  # already reported as a parse problem above
-            elif picture_options and letter is not None:
-                correct = letter  # "Bild 1–4": nothing to compare by text, the letter is the picture number
-                notes.append(f"[{qid}] picture options: took flashcard letter {'abcd'[letter]} directly — check the picture once")
-            elif card is None or letter is None or len(card["options"]) != 4:
-                problems.append(f"[{qid}] no usable flashcard/answer (card={card is not None}, answer={letter})")
+            if card is None or letter is None:
+                missing_reason = "not in the flashcards"
+            elif picture_options:
+                correct = letter  # "Bild 1–4": the letter is the picture number
+            elif len(card["options"]) != 4:
+                missing_reason = "could not read the flashcard"
+            elif max(similarity(card["question"], q["question"]),
+                     similarity(card["question"], q["question"], ordered=False)) < 0.6:
+                missing_reason = "new question since the 2017 flashcards"
             else:
-                q_sim = max(similarity(card["question"], q["question"]),
-                            similarity(card["question"], q["question"], ordered=False))
-                answer_text = card["options"][letter]
-                if q_sim < 0.6:
-                    problems.append(f"[{qid}] question was REPLACED since the flashcards — no answer available\n"
-                                    f"    catalog:   {q['question']}\n    flashcard: {card['question']}")
-                else:
-                    if q_sim < 0.85:
-                        notes.append(f"[{qid}] question reworded ({q_sim:.0%}):\n"
-                                     f"    catalog:   {q['question']}\n    flashcard: {card['question']}")
-                    found, exact = find_answer(answer_text, q["options"])
-                    if found is None:
-                        problems.append(f"[{qid}] answer not found: flashcard answer {'abcd'[letter]} = {answer_text!r}\n"
-                                        f"    catalog options: {q['options']}")
-                    else:
-                        correct = found
-                        if not exact:
-                            notes.append(f"[{qid}] FUZZY match, please check:\n"
-                                         f"    flashcard: {answer_text!r}\n    catalog:   {q['options'][found]!r}")
-                        elif found != letter:
-                            notes.append(f"[{qid}] options were reordered: flashcard {'abcd'[letter]} -> catalog {'abcd'[found]} ({answer_text!r})")
+                correct, _ = find_answer(card["options"][letter], q["options"])
+                if correct is None:
+                    missing_reason = "the flashcard's answer is no longer one of the options"
 
-        if TIME_SENSITIVE.search(q["question"]) and q["state"] is None:
-            notes.append(f"[{qid}] TIME-SENSITIVE: {q['question']} -> "
-                         f"{q['options'][correct] if correct is not None else 'no answer'}")
         if q["state"] is None and q["number"] in MANUAL_ANSWERS:
             correct, reason = MANUAL_ANSWERS[q["number"]]
-            notes.append(f"[{qid}] MANUAL answer (from Claude, please verify): {q['options'][correct]!r} — {reason}")
-            problems[:] = [p for p in problems if not p.startswith(f"[{qid}]")]
+            from_claude.append((entry, reason))
         if q["state"] and q["number"] in STATE_ANSWERS:
             correct = STATE_ANSWERS[q["number"]]
         entry["correct"] = correct
+
+        if correct is None:
+            missing.append((entry, missing_reason))
+        if q["state"] is None and TIME_SENSITIVE.search(q["question"]):
+            time_sensitive.append(entry)
         output.append(entry)
 
-    OUT_JSON.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    OUT_JSON.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
 
-    answered = sum(1 for e in output if e["correct"] is not None)
+    answered = len(output) - len(missing)
     summary = [
-        f"Questions written: {len(output)} ({len(general)} general + {len(mine)} {STATE_ID})",
-        f"With correct answer: {answered}, without: {len(output) - answered}",
-        f"Images written: {len(list(OUT_IMAGES.glob('*')))}",
-        "",
-        f"=== PROBLEMS — need a look ({len(problems)}) ===", *problems, "",
-        f"=== NOTES — answer was found, just FYI ({len(notes)}) ===", *notes,
+        f"Questions: {len(output)} ({len(general)} general + {len(mine)} {STATE_ID}), "
+        f"{answered} with answer, {len(missing)} without",
+        f"Images: {len(list(OUT_IMAGES.glob('*')))}",
     ]
-    OUT_REVIEW.write_text("\n".join(summary) + "\n", encoding="utf-8")
-    print("\n".join(summary[:3]))
-    print(f"{len(problems)} problems, {len(notes)} notes -> {OUT_REVIEW}")
+    review = [
+        "LiD quiz — review list (generated by tools/convert_catalog.py, do not edit by hand)",
+        "All wording is from the BAMF catalog. ✓ marks the answer currently in questions.json.",
+        *summary,
+        "",
+        f"=== 1. MISSING ANSWERS — please fill in ({len(missing)}) ===",
+        "Questions without an answer are skipped by the app.",
+        "Add answers in tools/convert_catalog.py: STATE_ANSWERS (NRW) or MANUAL_ANSWERS (general),",
+        "as  number: index  with index 0 = a, 1 = b, 2 = c, 3 = d. Then re-run the script.",
+        "",
+        *[describe(e, reason) for e, reason in missing],
+        f"=== 2. ANSWERS FROM CLAUDE — please verify ({len(from_claude)}) ===",
+        "The flashcards had no usable answer for these. If one is wrong, fix it in MANUAL_ANSWERS.",
+        "",
+        *[describe(e, reason) for e, reason in from_claude],
+        f"=== 3. TIME-SENSITIVE — check when the facts change ({len(time_sensitive)}) ===",
+        "",
+        *[describe(e) for e in time_sensitive],
+    ]
+    if problems:
+        review += [f"=== TECHNICAL PROBLEMS reading the PDF ({len(problems)}) ===", *problems]
+    OUT_REVIEW.write_text("\n".join(review) + "\n", encoding="utf-8", newline="\n")
+
+    print("\n".join(summary))
+    print(f"Review: {len(missing)} missing, {len(from_claude)} from Claude, {len(time_sensitive)} time-sensitive, "
+          f"{len(problems)} technical problems -> {OUT_REVIEW}")
+
+
+def describe(entry: dict, reason: str = "") -> str:
+    """One question as a readable block for review.txt."""
+    lines = [f"[{entry['id']}] {entry['question']}" + (f"   ({reason})" if reason else "")]
+    for i, option in enumerate(entry["options"]):
+        mark = " ✓" if entry["correct"] == i else ""
+        picture = f"   -> public/images/{entry['optionImages'][i]}" if "optionImages" in entry else ""
+        lines.append(f"    {'abcd'[i]}) {option}{mark}{picture}")
+    if "image" in entry:
+        lines.append(f"    image: public/images/{entry['image']}")
+    return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":
